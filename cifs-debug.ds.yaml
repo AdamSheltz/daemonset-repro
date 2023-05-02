@@ -1,0 +1,384 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cifs-credits-diag
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      name: cifs-credits-diag
+  template:
+    metadata:
+      labels:
+        name: cifs-credits-diag
+    spec:
+      containers:
+        - name: cifs-credits-diag
+          image: alpine:latest
+          command:
+            - nsenter
+            - --target
+            - "1"
+            - --mount
+            - --uts
+            - --ipc
+            - --pid
+            - --
+            - bash
+            - -c
+            - |
+                #!/bin/bash
+                ## ================ USER PARAMS ====================== ##
+                DETECTION_INTERVAL_SEC=10                   # collect "frequent" statistics (used to detect the condition we're interested in) once in this interval
+                COLLECTION_INTERVAL_MULT=30                 # collect "infrequent" statistics once in this interval
+                LOW_CREDIT_INSTANCES=3                      # no. of consecutive instances that we need to observe the condition to stop collecting stats
+                CIFS_CREDIT_THRESHOLD=32                    # cifs "low credit" threshold
+                TRACE_CMD_BUFSZ_BYTES=$((16 * 1024 * 1024)) # 16 MB; per-cpu buffer size for trace-cmd
+                DISK_SPACE_GROWTH_FACTOR=2                  # (total available space / this factor) gives us target size for the logdir
+                LOGDIR_FILL_ETA_HRS=2                       # bail out if we estimate that we will reach target logdir size in this time
+                LOGDIR="/tmp/cc_logs"                          # directory in which we collect logs
+                ## ========== DO NOT MODIFY BELOW THIS LINE ========== ##
+                
+                ##
+                STOP_COLLECTION_MARKER="/tmp/cifs_credit.stop"
+                INITIAL_INFO="$LOGDIR/initial_system_info"
+                ERR_LOG="$LOGDIR/errors"
+                DEBUGDATA_TMP="$LOGDIR/cifs_debug_data.tmp"
+                DEBUGDATA_OUT="$LOGDIR/cifs_debug_data"
+                CIFS_TRACE_DAT="trace.dat"
+                CIFS_TRACE_OUT="$LOGDIR/cifs_trace"
+                STATS_OUT="$LOGDIR/cifs_stats_out"
+                DMESG_OUT="$LOGDIR/cifs_dmesg"
+                CREDIT_HIST="$LOGDIR/cifs_credit_history"
+                UNIQUE_HOSTNAMES="$LOGDIR/unique_sessions_hostnames"
+                MY_PIDFILE="/tmp/cifs_credits_diag.pid"
+                
+                TRACE_CMD_INVOCATION="nohup trace-cmd record -e cifs -m $TRACE_CMD_BUFSZ_BYTES"
+                ##
+                
+                INITIAL_UPTIME=0
+                
+                UPTIME_BEGIN=0
+                
+                am_i_root() {
+                    local euid=$(id -u)
+                    if [ $euid -ne 0 ];
+                    then
+                        echo "Please run $0 as root"
+                        exit
+                    fi
+                }
+                
+                setup_logdir() {
+                    if [[ -d $LOGDIR ]]; then
+                        rm -fR $LOGDIR
+                    fi
+                    if [[ ! -d $LOGDIR ]]; then
+                        mkdir $LOGDIR
+                    fi
+                
+                    local err="$?"
+                    if [[ $err != 0 ]]; then
+                        echo "Error creating logdir: $err" |tee $ERR_LOG
+                        exit 1
+                    fi
+                }
+                
+                setup_debug() {
+                    # Get rid of the initial contents of dmesg. We're not really interested in them.
+                    # In any case, they should've been flushed down to /var/log/(kern.log|messages).
+                    dmesg -c -T > /dev/null
+                
+                    echo 'module cifs +p'   > /sys/kernel/debug/dynamic_debug/control
+                    echo 'file fs/cifs* +p' > /sys/kernel/debug/dynamic_debug/control
+                    echo 7 > /proc/fs/cifs/cifsFYI
+                
+                    $TRACE_CMD_INVOCATION 0<&- > /dev/null 2>&1 &
+                }
+                
+                check_diagcmds_present() {
+                    which trace-cmd > /dev/null;
+                    if [ $? == 1 ]; then
+                        echo "trace-cmd is not installed"
+                        exit 1
+                    fi
+                }
+                
+                check_space_consumption() {
+                    #
+                    # We'd like to do the following:
+                    #   - Print a message on syslog
+                    #   - Rotate and compress existing logs on disk
+                    #
+                    local current_uptime=$(awk -F[\ \.] '{print $1}' /proc/uptime);
+                    local current_runtime_sec=$(( current_uptime - INITIAL_UPTIME ))
+                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $2}')
+                    local logdir_consumed_space_kb=$(du -k $LOGDIR | awk '{print $1}');
+                    local time_to_fill_sec;
+                    local time_to_fill_hrs;
+                    local logdir_target_space_kb=$(                                         \
+                                awk -v free_space=$disk_free_space_kb                       \
+                                    -v growth_factor=$DISK_SPACE_GROWTH_FACTOR              \
+                                        ' BEGIN {                                           \
+                                            printf "%d\n", (free_space/growth_factor * 1.0) \
+                                } '                                                         \
+                    );
+                
+                    time_to_fill_sec=" -- ";
+                    time_to_fill_hrs=" -- ";
+                    if (( $current_runtime_sec > 0 )); then
+                        time_to_fill_sec=$(                                                         \
+                                awk -v space_consumed=$logdir_consumed_space_kb                     \
+                                    -v time_taken=$current_runtime_sec                              \
+                                    -v space_available=$logdir_target_space_kb                      \
+                                    ' BEGIN {                                                       \
+                                        growth_rate=(space_consumed/time_taken);                    \
+                                        time_to_fill=(space_available/growth_rate);                 \
+                                        printf "%d\n", time_to_fill                                 \
+                                    } '                                                             \
+                        );
+                
+                        time_to_fill_hrs=$(                           \
+                                awk -v time_sec=$time_to_fill_sec     \
+                                ' BEGIN {                             \
+                                    printf "%d\n", (time_sec/3600)    \
+                                } '                                   \
+                        );
+                
+                        if (( time_to_fill_hrs >= LOGDIR_FILL_ETA_HRS )); then
+                            logger -p local0.alert "ALERT: $0 (pid $!) on $(hostname) $LOGDIR_FILL_ETA_HRS hours away from filling up the log directory."
+                        fi
+                    fi
+                
+                    echo
+                    echo "current script runtime: $current_runtime_sec seconds"
+                    echo "disk space available  : $disk_free_space_kb kbytes"
+                    echo "space consumed by logs: $logdir_consumed_space_kb kbytes"
+                    echo "target logdir space   : $logdir_target_space_kb kbytes"
+                    echo "estimated time to reach target logdir space: $time_to_fill_sec seconds / $time_to_fill_hrs hours"
+                    echo "  (under _current_ workload)"
+                    echo
+                    if (( logdir_space_consumed_kb >= logdir_target_space_kb )); then
+                           echo "--> CROSSED TARGET LOGDIR SPACE THRESHOLD <--"
+                           echo "--> STOPPING LOG COLLECTION               <--"
+                           touch $STOP_COLLECTION_MARKER
+                    fi
+                }
+                
+                collect_initial_info() {
+                    INITIAL_UPTIME=$(awk -F[\ \.] '{print $1}' /proc/uptime)
+                
+                    date -u;
+                    echo "hostname $(hostname) running $(uname -smr)"
+                    echo "/proc/uptime: $(cat /proc/uptime)";
+                    echo "uptime: $(uptime)";
+                    echo "last reboot info :"
+                    last reboot;
+                    egrep 'CIFS Version' /proc/fs/cifs/DebugData
+                    mount.cifs -V;
+                }
+                
+                setup() {
+                    if [[ -f $STOP_COLLECTION_MARKER ]]; then
+                        rm -f $STOP_COLLECTION_MARKER;
+                    fi
+                
+                    setup_logdir;
+                    check_diagcmds_present |tee $ERR_LOG
+                    setup_debug;
+                	collect_initial_info > $INITIAL_INFO ;
+                
+                    trap stop_collection_and_exit SIGINT;
+                    trap stop_collection_and_exit SIGKILL;
+                
+                    echo $! > $MY_PIDFILE
+                    echo "-----------------------------------------------------------------------------"
+                    echo "Collecting CIFS credit and related stats ($(date -u +'%Y %b %d %H:%M:%S UTC'))"
+                    echo "To stop log collection, please hit Ctrl-C, or run \"kill -9 $!\" as root"
+                    echo "-----------------------------------------------------------------------------"
+                }
+                
+                collect_infrequent_stats() {
+                    datestr="DATE: $(date -u +'%Y %b %d-%H:%M:%S') UTC"
+                    echo $datestr >> $STATS_OUT
+                    echo >> $STATS_OUT
+                    cat /proc/fs/cifs/Stats >> $STATS_OUT
+                    echo "===" >> $STATS_OUT
+                
+                    datestr="DATE: $(date -u +'%Y %b %d-%H:%M:%S') UTC"
+                    echo $datestr >> $DMESG_OUT
+                    echo >> $DMESG_OUT
+                    dmesg -c -T >> $DMESG_OUT
+                    echo "===" >> $DMESG_OUT
+                }
+                
+                collect_stats() {
+                    wcnt=$1
+                
+                    datestr="DATE: $(date -u +'%Y %b %d-%H:%M:%S') UTC"
+                    cat /proc/fs/cifs/DebugData > $DEBUGDATA_TMP
+                    #echo $datestr >> $DEBUGDATA_OUT
+                    #echo >> $DEBUGDATA_OUT
+                    #cat $DEBUGDATA_TMP >> $DEBUGDATA_OUT
+                    #echo "===" >> $DEBUGDATA_OUT
+                
+                    #
+                    # CIFS DebugData has the credit count on the line _immediately after_ the
+                    # ConnectionId line.  We also want the inflight info.  Stitch the 4 lines
+                    # including the ConnectionId line together, and mark it LOWCRED if the credit
+                    # count is lower than the threshold.
+                    #
+                    echo "$datestr " >> $CREDIT_HIST
+                    egrep -A3 'ConnectionId' $DEBUGDATA_TMP |
+                        tr -d '\n'                          |
+                        sed 's/--/\n/g'                     |
+                        awk -v threshold=$CIFS_CREDIT_THRESHOLD '/ConnectionId/ {if ($9 <= threshold) {print $0, "LOWCRED"} else {print $0}}' >> $CREDIT_HIST
+                    echo >> $CREDIT_HIST
+                    echo "== " >> $CREDIT_HIST
+                    rm -f $DEBUGDATA_TMP
+                
+                    collect_infrequent_stats_trigger=$((wcnt % COLLECTION_INTERVAL_MULT))
+                    if (( $collect_infrequent_stats_trigger == 0 ))
+                    then
+                        collect_infrequent_stats
+                    fi
+                }
+                
+                check_low_credits() {
+                    #
+                    # Create a list of unique (session_id, hostname) stored as a regexp.
+                    #
+                    awk '/ConnectionId/ {printf("%s.*%s\n", $3, $5)}' $CREDIT_HIST |\
+                        sort |\
+                        uniq > $UNIQUE_HOSTNAMES;
+                
+                    #
+                    #  For each (session_id, hostname), look at the last $LOW_CREDIT_INSTANCES
+                    #  entries in the credit history; if all of them are marked LOWCRED, stop
+                    #  log collection and generate the tarball.
+                    #
+                    while read hostsession; do
+                        #
+                        # make sure that we see LOWCRED, as well as $(NF - 1) <= 2
+                        #
+                        #lowcred_count=$(egrep $hostsession $CREDIT_HIST|\
+                        #               tail -n $LOW_CREDIT_INSTANCES   |\
+                        #               egrep -c 'LOWCRED')
+                        lowcred_count=$(egrep $hostsession $CREDIT_HIST |   \
+                                        tail -n $LOW_CREDIT_INSTANCES   |   \
+                                        awk 'BEGIN {                        \
+                                            lowcred_count=0;                \
+                                        }                                   \
+                                        ($(NF-1) <= 2) && /LOWCRED/ {       \
+                                            lowcred_count++;                \
+                                        }                                   \
+                                        END {                               \
+                                            printf "%d\n", lowcred_count;   \
+                                        }'                                  \
+                        );
+                        if (( $lowcred_count == $LOW_CREDIT_INSTANCES ))
+                        then
+                            echo "--> Low credit situation found on $hostsession <--"
+                            echo "--> Stopping log collection"
+                            teardown
+                            exit 1
+                        fi
+                    done<$UNIQUE_HOSTNAMES
+                }
+                
+                collect_periodic_stats() {
+                    wakeup_count=0
+                    while true
+                    do
+                        echo "Wakeup to collect stats [$wakeup_count]"
+                        check_space_consumption;
+                
+                        if [ -e $STOP_COLLECTION_MARKER ]; then
+                            rm -f $STOP_COLLECTION_MARKER;
+                            break
+                        fi
+                
+                        collect_stats $wakeup_count;
+                        check_low_credits;
+                        wakeup_count=$((wakeup_count + 1))
+                
+                        sleep $DETECTION_INTERVAL_SEC;
+                    done
+                }
+                
+                kill_trace_cmd_gen_report() {
+                    local retry=0
+                	local trace_cmd_pid=$(pgrep trace-cmd | head -1)
+                    kill -INT $trace_cmd_pid
+                	while [ $? == 0 ] && [ $retry -lt 10 ]
+                	do
+                	    retry=`expr $retry + 1`
+                		sleep 1
+                		ps -p "$trace_cmd_pid" > /dev/null
+                    done
+                
+                    trace-cmd report > $CIFS_TRACE_OUT
+                }
+                
+                teardown_debug() {
+                    kill_trace_cmd_gen_report
+                
+                    echo 0 > /proc/fs/cifs/cifsFYI;
+                    echo 'file fs/cifs* -p' > /sys/kernel/debug/dynamic_debug/control
+                    echo 'module cifs -p' > /sys/kernel/debug/dynamic_debug/control
+                }
+                
+                teardown_errlog() {
+                    #
+                    # If the error log is empty, get rid of it
+                    #
+                    if [ ! -s $ERR_LOG ]; then
+                        rm $ERR_LOG;
+                    fi
+                }
+                
+                stop_collection_and_exit() {
+                    echo "Received Ctrl-C, stopping log collection and collating logs"
+                    touch $STOP_COLLECTION_MARKER
+                }
+                
+                teardown() {
+                    collect_infrequent_stats;
+                
+                    teardown_debug;
+                    teardown_errlog;
+                
+                    tarball_name="$(hostname)_$(date -u +'%Y%b%d-%H-%M-%S')_UTC_logs.tgz"
+                    mv ./trace.dat $LOGDIR
+                    tar czf $tarball_name $LOGDIR
+                    echo ""
+                    echo "==> Created tarball $tarball_name with logs"
+                    echo "Please send a copy of this tarball to Microsoft support for further analysis"
+                    echo "-----------------------------------------------------------------------------"
+                
+                    if [[ -d $LOGDIR ]]; then
+                         rm -fR $LOGDIR
+                    fi
+                }
+                
+                main() {
+                    am_i_root
+                    setup
+                
+                    collect_periodic_stats
+                
+                    teardown
+                }
+
+                main
+
+          volumeMounts:
+            - name: cifs-scripts
+              mountPath: /opt
+          securityContext:
+            privileged: true
+      hostPID: true
+      volumes:
+        - name: cifs-scripts
+          configMap:
+            name: cifs-credits-diag
