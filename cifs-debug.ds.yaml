@@ -66,7 +66,7 @@ spec:
                 
                 am_i_root() {
                     local euid=$(id -u)
-                    if [ $euid -ne 0 ];
+                    if [ "$euid" -ne 0 ];
                     then
                         echo "Please run $0 as root"
                         exit
@@ -80,8 +80,8 @@ spec:
                     #
                     datestr=$(date -u +'%Y%b%d-%H-%M-%S')
                     tarball_name="$(hostname)_${datestr}_UTC_logs_${LOG_ROTATE_COUNT}.tgz"
-                    temp_logdir="${LOGDIR}_${datestr}
-                    cp -r $LOGDIR $temp_logdir
+                    temp_logdir="${LOGDIR}_${datestr}"
+                    cp -r $LOGDIR "$temp_logdir"
                     tar czf $tarball_name $temp_logdir
                     rm -fR $temp_logdir
                     LOG_ROTATE_COUNT=$((LOG_ROTATE_COUNT + 1))
@@ -214,8 +214,7 @@ spec:
                 	collect_initial_info > $INITIAL_INFO ;
                 
                     trap stop_collection_and_exit SIGINT;
-                    trap stop_collection_and_exit SIGKILL;
-                
+                    
                     echo $! > $MY_PIDFILE
                     echo "-----------------------------------------------------------------------------"
                     echo "Collecting CIFS credit and related stats ($(date -u +'%Y %b %d %H:%M:%S UTC'))"
