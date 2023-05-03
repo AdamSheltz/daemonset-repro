@@ -168,7 +168,7 @@ spec:
                         );
                 
                         if (( time_to_fill_hrs <= LOGDIR_FILL_ETA_HRS )); then
-                            logger -p local0.alert "ALERT: $0 (pid $!) on $(hostname) $LOGDIR_FILL_ETA_HRS hours away from filling up the log directory."
+                            logger -p local0.alert "ALERT: $0 $(pid $!) on $(hostname) $LOGDIR_FILL_ETA_HRS hours away from filling up the log directory."
                         fi
                     fi
                 
