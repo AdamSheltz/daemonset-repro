@@ -480,14 +480,10 @@ spec:
                 
                 main
 
-          volumeMounts:
-            - name: cifs-scripts
-              mountPath: /opt
+         
           securityContext:
             privileged: true
       hostPID: true
-      volumes:
-        - name: cifs-scripts
-          configMap:
-            name: cifs-credits-diag
+
+       
 
