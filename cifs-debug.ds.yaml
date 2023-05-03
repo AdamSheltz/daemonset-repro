@@ -28,21 +28,26 @@ spec:
             - -c
             - |
                 #!/bin/bash
+                
                 ## ================ USER PARAMS ====================== ##
-                DETECTION_INTERVAL_SEC=10                   # collect "frequent" statistics (used to detect the condition we're interested in) once in this interval
-                COLLECTION_INTERVAL_MULT=30                 # collect "infrequent" statistics once in this interval
-                LOW_CREDIT_INSTANCES=3                      # no. of consecutive instances that we need to observe the condition to stop collecting stats
-                CIFS_CREDIT_THRESHOLD=32                    # cifs "low credit" threshold
+                DETECTION_INTERVAL_SEC=10   # dump "frequent" statistics once in this interval
+                COLLECTION_INTERVAL_MULT=30 # dump "infrequent" statistics once in (DETECTION_INTERVAL_SEC * this mult) 
+                CREDIT_LOG_INTERVAL_MULT=30 # dump credit history to syslog once in (DETECTION_INTERVAL_SEC * this mult)
+                LOW_CREDIT_INSTANCES=12     # consecutive low-credit instances to trigger alert
+                                            # (we want the lowcred condition to last at least 2 minutes)
+                CIFS_INFLIGHT_THRESHOLD=5 
+                CIFS_CREDIT_THRESHOLD=200   # cifs "low credit" threshold; we get 212 credits at mount-time.
                 TRACE_CMD_BUFSZ_BYTES=$((16 * 1024 * 1024)) # 16 MB; per-cpu buffer size for trace-cmd
-                DISK_SPACE_GROWTH_FACTOR=2                  # (total available space / this factor) gives us target size for the logdir
-                LOGDIR_FILL_ETA_HRS=2                       # bail out if we estimate that we will reach target logdir size in this time
-                LOGDIR="/tmp/cc_logs"                          # directory in which we collect logs
+                DISK_SPACE_GROWTH_FACTOR=2  # (available space / this factor) gives us target logdir size
+                LOGDIR_FILL_ETA_HRS=2       # bail out if we estimate that we will reach target logdir size in this time
+                LOGDIR="/tmp/cc_logs"          # directory in which we collect logs
                 ## ========== DO NOT MODIFY BELOW THIS LINE ========== ##
                 
                 ##
                 STOP_COLLECTION_MARKER="/tmp/cifs_credit.stop"
                 INITIAL_INFO="$LOGDIR/initial_system_info"
                 ERR_LOG="$LOGDIR/errors"
+                CRITICAL_TRIGGER_LOG="$LOGDIR/critical_triggers"
                 DEBUGDATA_TMP="$LOGDIR/cifs_debug_data.tmp"
                 DEBUGDATA_OUT="$LOGDIR/cifs_debug_data"
                 CIFS_TRACE_DAT="trace.dat"
@@ -57,8 +62,7 @@ spec:
                 ##
                 
                 INITIAL_UPTIME=0
-                
-                UPTIME_BEGIN=0
+                LOG_ROTATE_COUNT=0
                 
                 am_i_root() {
                     local euid=$(id -u)
@@ -69,9 +73,27 @@ spec:
                     fi
                 }
                 
+                rotate_logdir() {
+                    #
+                    # Archive current logdir
+                    # Nuke existing log files
+                    #
+                    datestr=$(date -u +'%Y%b%d-%H-%M-%S')
+                    tarball_name="$(hostname)_${datestr}_UTC_logs_${LOG_ROTATE_COUNT}.tgz"
+                    temp_logdir="${LOGDIR}_${datestr}
+                    cp -r $LOGDIR $temp_logdir
+                    tar czf $tarball_name $temp_logdir
+                    rm -fR $temp_logdir
+                    LOG_ROTATE_COUNT=$((LOG_ROTATE_COUNT + 1))
+                
+                    #Get rid of the oldest N logs?
+                    rm -fR $LOGDIR;
+                    mkdir $LOGDIR;
+                }
+                
                 setup_logdir() {
                     if [[ -d $LOGDIR ]]; then
-                        rm -fR $LOGDIR
+                        rotate_logdir
                     fi
                     if [[ ! -d $LOGDIR ]]; then
                         mkdir $LOGDIR
@@ -145,7 +167,7 @@ spec:
                                 } '                                   \
                         );
                 
-                        if (( time_to_fill_hrs >= LOGDIR_FILL_ETA_HRS )); then
+                        if (( time_to_fill_hrs <= LOGDIR_FILL_ETA_HRS )); then
                             logger -p local0.alert "ALERT: $0 (pid $!) on $(hostname) $LOGDIR_FILL_ETA_HRS hours away from filling up the log directory."
                         fi
                     fi
@@ -178,11 +200,14 @@ spec:
                     mount.cifs -V;
                 }
                 
-                setup() {
+                cleanup_markers() {
                     if [[ -f $STOP_COLLECTION_MARKER ]]; then
                         rm -f $STOP_COLLECTION_MARKER;
                     fi
+                }
                 
+                setup() {
+                    cleanup_markers;
                     setup_logdir;
                     check_diagcmds_present |tee $ERR_LOG
                     setup_debug;
@@ -206,6 +231,12 @@ spec:
                     echo "===" >> $STATS_OUT
                 
                     datestr="DATE: $(date -u +'%Y %b %d-%H:%M:%S') UTC"
+                    echo $datestr >> $DEBUGDATA_OUT
+                    echo >> $DEBUGDATA_OUT
+                    cat /proc/fs/cifs/DebugData >> $DEBUGDATA_OUT
+                    echo "===" >> $DEBUGDATA_OUT
+                
+                    datestr="DATE: $(date -u +'%Y %b %d-%H:%M:%S') UTC"
                     echo $datestr >> $DMESG_OUT
                     echo >> $DMESG_OUT
                     dmesg -c -T >> $DMESG_OUT
@@ -217,10 +248,6 @@ spec:
                 
                     datestr="DATE: $(date -u +'%Y %b %d-%H:%M:%S') UTC"
                     cat /proc/fs/cifs/DebugData > $DEBUGDATA_TMP
-                    #echo $datestr >> $DEBUGDATA_OUT
-                    #echo >> $DEBUGDATA_OUT
-                    #cat $DEBUGDATA_TMP >> $DEBUGDATA_OUT
-                    #echo "===" >> $DEBUGDATA_OUT
                 
                     #
                     # CIFS DebugData has the credit count on the line _immediately after_ the
@@ -228,11 +255,20 @@ spec:
                     # including the ConnectionId line together, and mark it LOWCRED if the credit
                     # count is lower than the threshold.
                     #
+                    # XXX what we need from debugdata:
+                    #   - ConnectionId, Hostname, Num Credits, Req on Wire, and (empty) list of MIDs that follows the 'MIDs:' line.
+                    #
                     echo "$datestr " >> $CREDIT_HIST
-                    egrep -A3 'ConnectionId' $DEBUGDATA_TMP |
-                        tr -d '\n'                          |
-                        sed 's/--/\n/g'                     |
-                        awk -v threshold=$CIFS_CREDIT_THRESHOLD '/ConnectionId/ {if ($9 <= threshold) {print $0, "LOWCRED"} else {print $0}}' >> $CREDIT_HIST
+                    egrep -A3 'ConnectionId' $DEBUGDATA_TMP   |
+                        tr -d '\n'                            |
+                        sed 's/--/\n/g'                       |
+                        awk -v threshold=$CIFS_CREDIT_THRESHOLD \
+                            ' /ConnectionId/ {                  \
+                                if ($9 <= threshold) {          \
+                                    printf "%s LOWCRED\n", $0   \
+                                } else {                        \
+                                    printf "%s\n", $0           \
+                                }} ' >> $CREDIT_HIST
                     echo >> $CREDIT_HIST
                     echo "== " >> $CREDIT_HIST
                     rm -f $DEBUGDATA_TMP
@@ -242,48 +278,115 @@ spec:
                     then
                         collect_infrequent_stats
                     fi
+                
+                    log_credit_score_trigger=$((wcnt % CREDIT_LOG_INTERVAL_MULT))
+                    if (( $log_credit_score_trigger == 0 ))
+                    then
+                        # extract session id, mountpoint, credit score, and inflight requests.
+                        # log these to syslog.
+                        egrep -A3 'ConnectionId' /proc/fs/cifs/DebugData    |
+                            tr -d '\n'                                      |
+                            sed 's/--/\n/g' > $DEBUGDATA_TMP
+                        echo >> $DEBUGDATA_TMP
+                
+                        while read cr_log_line; do
+                            logger -p local0.warning "CIFS_CREDIT_LOG: $datestr $cr_log_line"
+                        done<$DEBUGDATA_TMP
+                    fi
+                    rm -f $DEBUGDATA_TMP
+                
                 }
                 
-                check_low_credits() {
+                
+                check_trigger_conditions() {
+                    local low_credit_count;
+                    local zero_credit_count;
                     #
-                    # Create a list of unique (session_id, hostname) stored as a regexp.
+                    # === Check to see if the credit count is below 20, 3 times in a row ===
                     #
-                    awk '/ConnectionId/ {printf("%s.*%s\n", $3, $5)}' $CREDIT_HIST |\
-                        sort |\
-                        uniq > $UNIQUE_HOSTNAMES;
+                    # Note that any instance of credit < 20 is marked LOWCRED in collect_stats.
+                    # Create a list of unique (session_id, hostname) tuples, store each tuple
+                    # as a regexp in the $UNIQUE_HOSTNAMES file.
+                    #
+                    awk '/ConnectionId/ {printf("%s.*%s\n", $3, $5)}' $CREDIT_HIST  |
+                        sort  |
+                        uniq  > $UNIQUE_HOSTNAMES;
                 
                     #
                     #  For each (session_id, hostname), look at the last $LOW_CREDIT_INSTANCES
                     #  entries in the credit history; if all of them are marked LOWCRED, stop
                     #  log collection and generate the tarball.
                     #
+                    local logs_need_rotation=0
                     while read hostsession; do
+                        #lowcred_count=$(egrep $hostsession $CREDIT_HIST|
+                        #               tail -n $LOW_CREDIT_INSTANCES   |
+                        #               egrep -c 'LOWCRED')
+                
                         #
                         # make sure that we see LOWCRED, as well as $(NF - 1) <= 2
+                        # $(NF - 1) is _coincidentally_ the inflight request count.
                         #
-                        #lowcred_count=$(egrep $hostsession $CREDIT_HIST|\
-                        #               tail -n $LOW_CREDIT_INSTANCES   |\
-                        #               egrep -c 'LOWCRED')
-                        lowcred_count=$(egrep $hostsession $CREDIT_HIST |   \
-                                        tail -n $LOW_CREDIT_INSTANCES   |   \
-                                        awk 'BEGIN {                        \
-                                            lowcred_count=0;                \
-                                        }                                   \
-                                        ($(NF-1) <= 2) && /LOWCRED/ {       \
-                                            lowcred_count++;                \
-                                        }                                   \
-                                        END {                               \
-                                            printf "%d\n", lowcred_count;   \
-                                        }'                                  \
+                        # XXX - check the inflight count and compare it with the 
+                        #       number of MIDs in the MID list from debugdata?
+                        #
+                        low_credit_count=$(egrep $hostsession $CREDIT_HIST  |
+                                        tail -n $LOW_CREDIT_INSTANCES       |
+                                        awk -v if_threshold=$CIFS_INFLIGHT_THRESHOLD    \
+                                        'BEGIN {                                        \
+                                            lowcred_count=0;                            \
+                                        }                                               \
+                                        ($(NF-1) <= if_threshold) && /LOWCRED/ {        \
+                                            lowcred_count++;                            \
+                                        }                                               \
+                                        END {                                           \
+                                            printf "%d\n", lowcred_count;               \
+                                        }'                                              \
                         );
-                        if (( $lowcred_count == $LOW_CREDIT_INSTANCES ))
+                
+                        if (( low_credit_count == LOW_CREDIT_INSTANCES ))
                         then
                             echo "--> Low credit situation found on $hostsession <--"
-                            echo "--> Stopping log collection"
-                            teardown
-                            exit 1
+                            #
+                            # do _not_ stop log collection, fire off an alert to syslog,
+                            # rotate logs, and _continue_ until we hit the termination condition.
+                            #
+                            logs_need_rotation=1
+                            logger -p local0.warning "CIFS_CREDIT_ALERT: low credit on $hostsession"
+                        fi
+                
+                        #
+                        # The "termination check" is (inflight <= 2) && (credit == 0)
+                        #
+                        zero_cred_count=$(egrep $hostsession $CREDIT_HIST   |
+                            tail -n $LOW_CREDIT_INSTANCES                   |
+                            awk 'BEGIN {                        \
+                                    zero_cred_count=0;          \
+                            }                                   \
+                            ($(NF-1) <= 2) && ($9 == 0) {       \
+                                zero_cred_count++;              \
+                            }                                   \
+                            END {                               \
+                                printf "%d\n", zero_cred_count; \
+                            }'                                  \
+                         );
+                
+                        if (( zero_cred_count == LOW_CREDIT_INSTANCES )); then
+                            logger -p local0.alert "CIFS_CREDIT_LOG: stopping log collection"
+                            echo "--> HIT CRITICAL TRIGGER at $(date) -- BUT CONTINUING" >> $CRITICAL_TRIGGER_LOG
+                            logs_need_rotation=1
+                
+                            # We keep running even if we hit the termination condition
+                            #echo "--> Stopping log collection"
+                            #teardown
+                            #exit 1
                         fi
                     done<$UNIQUE_HOSTNAMES
+                
+                    if ((logs_need_rotation == 1)); then
+                        logs_need_rotation=0;
+                        rotate_logdir
+                    fi
                 }
                 
                 collect_periodic_stats() {
@@ -299,7 +402,7 @@ spec:
                         fi
                 
                         collect_stats $wakeup_count;
-                        check_low_credits;
+                        check_trigger_conditions;
                         wakeup_count=$((wakeup_count + 1))
                 
                         sleep $DETECTION_INTERVAL_SEC;
@@ -309,12 +412,13 @@ spec:
                 kill_trace_cmd_gen_report() {
                     local retry=0
                 	local trace_cmd_pid=$(pgrep trace-cmd | head -1)
+                
                     kill -INT $trace_cmd_pid
-                	while [ $? == 0 ] && [ $retry -lt 10 ]
-                	do
-                	    retry=`expr $retry + 1`
-                		sleep 1
-                		ps -p "$trace_cmd_pid" > /dev/null
+                    while [ $? == 0 ] && [ $retry -lt 10 ]
+                    do
+                	   retry=$(( retry + 1 ))
+                       sleep 1
+                	   ps -p "$trace_cmd_pid" > /dev/null
                     done
                 
                     trace-cmd report > $CIFS_TRACE_OUT
@@ -348,13 +452,17 @@ spec:
                     teardown_debug;
                     teardown_errlog;
                 
-                    tarball_name="$(hostname)_$(date -u +'%Y%b%d-%H-%M-%S')_UTC_logs.tgz"
-                    mv ./trace.dat $LOGDIR
+                    cur_tarball_prefix="$(hostname)_$(date -u +'%Y%b%d-%H-%M-%S')_UTC_logs"
+                    tarball_name="${cur_tarball_prefix}_${LOG_ROTATE_COUNT}.tgz"
                     tar czf $tarball_name $LOGDIR
+                
+                    composite_tarball_name="COMPOSITE_${cur_tarball_prefix}.tgz"
+                    tar czf $composite_tarball_name ./$(hostname)_*
                     echo ""
-                    echo "==> Created tarball $tarball_name with logs"
+                    echo "==> Created composite tarball $composite_tarball_name"
                     echo "Please send a copy of this tarball to Microsoft support for further analysis"
                     echo "-----------------------------------------------------------------------------"
+                    rm -f ./$(hostname)_*
                 
                     if [[ -d $LOGDIR ]]; then
                          rm -fR $LOGDIR
@@ -369,7 +477,7 @@ spec:
                 
                     teardown
                 }
-
+                
                 main
 
           volumeMounts:
@@ -382,3 +490,4 @@ spec:
         - name: cifs-scripts
           configMap:
             name: cifs-credits-diag
+
