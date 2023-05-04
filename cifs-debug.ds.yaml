@@ -15,6 +15,17 @@ spec:
       containers:
         - name: cifs-credits-diag
           image: alpine:latest
+          lifecycle:
+          postStart:
+            exec:
+              command: 
+              - sh
+              - -c
+              - >
+                logger "$(date -u +'%Y%b%d-%H-%M-%S') Container started in pod $(hostname)"
+          preStop:
+            exec:
+              command: ["/bin/sh","-c","while killall cifs_credit_diag.sh; do sleep 1; done"]
           command:
             - nsenter
             - --target
