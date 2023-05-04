@@ -15,6 +15,17 @@ spec:
       containers:
         - name: cifs-credits-diag
           image: alpine:latest
+          livenessProbe:
+            exec:
+              command:
+              - bash
+              - -c
+              - |
+                  disk_usage=$(df -h / | awk '{print $5}' | tail -n 1)
+                  disk_usage_percent=${disk_usage%%%}
+                  if [[ $disk_usage_percent > 50 ]]; then exit 199; fi
+            initialDelaySeconds: 5
+            periodSeconds: 10
           command:
             - nsenter
             - --target
@@ -134,7 +145,7 @@ spec:
                     #
                     local current_uptime=$(awk -F[\ \.] '{print $1}' /proc/uptime);
                     local current_runtime_sec=$(( current_uptime - INITIAL_UPTIME ))
-                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $2}')
+                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $4}')
                     local logdir_consumed_space_kb=$(du -k $LOGDIR | awk '{print $1}');
                     local time_to_fill_sec;
                     local time_to_fill_hrs;
