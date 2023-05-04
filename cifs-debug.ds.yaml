@@ -134,7 +134,7 @@ spec:
                     #
                     local current_uptime=$(awk -F[\ \.] '{print $1}' /proc/uptime);
                     local current_runtime_sec=$(( current_uptime - INITIAL_UPTIME ))
-                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $2}')
+                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $4}')
                     local logdir_consumed_space_kb=$(du -k $LOGDIR | awk '{print $1}');
                     local time_to_fill_sec;
                     local time_to_fill_hrs;
