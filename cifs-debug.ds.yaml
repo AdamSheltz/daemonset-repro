@@ -26,11 +26,11 @@ spec:
                   if [[ $disk_usage_percent > 50 ]]; then exit 199; fi
             initialDelaySeconds: 5
             periodSeconds: 10
-        preStop:
+        lifecycle:
+          preStop:
            exec:
              command: ["/bin/sh","-c","while killall cifs_credit_diag.sh; do sleep 1; done"]
-            
-          command:
+        command:
             - nsenter
             - --target
             - "1"
