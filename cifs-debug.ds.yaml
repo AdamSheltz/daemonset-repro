@@ -24,7 +24,7 @@ spec:
                   disk_usage=$(df -h / | awk '{print $5}' | tail -n 1)
                   disk_usage_percent=${disk_usage%%%}
                   if [[ $disk_usage_percent > 50 ]]; then exit 199; fi
-            initialDelaySeconds: 180
+            initialDelaySeconds: 5
             periodSeconds: 10
           lifecycle:
             preStop:
