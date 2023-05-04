@@ -28,7 +28,7 @@ spec:
             - -c
             - |
                 #!/bin/bash
-                
+                DEBIAN_FRONTEND=noninteractive apt-get -y install trace-cmd
                 ## ================ USER PARAMS ====================== ##
                 DETECTION_INTERVAL_SEC=10   # dump "frequent" statistics once in this interval
                 COLLECTION_INTERVAL_MULT=30 # dump "infrequent" statistics once in (DETECTION_INTERVAL_SEC * this mult) 
