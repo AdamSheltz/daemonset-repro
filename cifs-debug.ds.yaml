@@ -15,6 +15,21 @@ spec:
       containers:
         - name: cifs-credits-diag
           image: alpine:latest
+          livenessProbe:
+            exec:
+              command:
+              - bash
+              - -c
+              - |
+                  disk_usage=$(df -h / | awk '{print $5}' | tail -n 1)
+                  disk_usage_percent=${disk_usage%%%}
+                  if [[ $disk_usage_percent > 50 ]]; then exit 199; fi
+            initialDelaySeconds: 5
+            periodSeconds: 10
+        preStop:
+           exec:
+             command: ["/bin/sh","-c","while killall cifs_credit_diag.sh; do sleep 1; done"]
+            
           command:
             - nsenter
             - --target
@@ -28,7 +43,26 @@ spec:
             - -c
             - |
                 #!/bin/bash
-                DEBIAN_FRONTEND=noninteractive apt-get -y install trace-cmd
+                if ! command -v trace-cmd &> /dev/null
+                  then
+                  # If trace-cmd is not installed, attempt to install it
+                  echo "trace-cmd is not installed. Attempting to install..."
+
+                 # Install trace-cmd using apt-get
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y trace-cmd
+
+                 # Check if installation was successful
+                 if ! command -v trace-cmd &> /dev/null
+                   then
+                   echo "Error: Failed to install trace-cmd." >&2
+                   exit 201
+                   else
+                   echo "trace-cmd is now installed."
+                 fi
+                 else
+                 # If trace-cmd is already installed, print a message indicating that it's installed
+                 echo "trace-cmd is already installed."
+                fi
                 ## ================ USER PARAMS ====================== ##
                 DETECTION_INTERVAL_SEC=10   # dump "frequent" statistics once in this interval
                 COLLECTION_INTERVAL_MULT=30 # dump "infrequent" statistics once in (DETECTION_INTERVAL_SEC * this mult) 
@@ -134,7 +168,7 @@ spec:
                     #
                     local current_uptime=$(awk -F[\ \.] '{print $1}' /proc/uptime);
                     local current_runtime_sec=$(( current_uptime - INITIAL_UPTIME ))
-                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $2}')
+                    local disk_free_space_kb=$(df -k --total $(pwd) | awk '/total/ {print $4}')
                     local logdir_consumed_space_kb=$(du -k $LOGDIR | awk '{print $1}');
                     local time_to_fill_sec;
                     local time_to_fill_hrs;
@@ -483,6 +517,3 @@ spec:
           securityContext:
             privileged: true
       hostPID: true
-
-       
-
